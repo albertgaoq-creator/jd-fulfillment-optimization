@@ -12,7 +12,7 @@ Semester final project scaffold for analyzing JD.com transaction-level data with
 
 1. Create a Python environment and install `requirements.txt`.
 2. Put the JD CSV files in `data/raw/`, or point the notebook to your local dataset folder.
-3. Open [notebooks/01_jd_project_starter.ipynb](C:\Users\Qiang Gao\Desktop\IE5404-JD\notebooks\01_jd_project_starter.ipynb).
+3. Open [notebooks/01_jd_project_starter.ipynb].
 4. Run the data audit, feature engineering, and candidate-assignment cells.
 
 ## Core files
