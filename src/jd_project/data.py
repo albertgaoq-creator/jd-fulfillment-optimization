@@ -1,176 +1,306 @@
+"""Data loading and cleaning helpers for the JD course project.
+
+This module is intentionally simple and notebook-friendly. It focuses only on
+reading the six raw CSV tables and applying light, defensive cleaning so the
+rest of the project can start from consistent pandas DataFrames.
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
+import re
 
 import pandas as pd
 
-from .config import JD_FILENAMES, RAW_DATA_DIR
 
-DATE_COLUMNS = {
-    "orders": ["order_date", "order_time"],
-    "delivery": ["ship_out_time", "arr_station_time", "arr_time"],
-    "inventory": ["date"],
-    "skus": ["activate_date", "deactivate_date"],
-    "users": ["first_order_month"],
+TABLE_FILE_CANDIDATES = {
+    "orders": ["JD_order_data.csv", "orders.csv", "order.csv"],
+    "delivery": ["JD_delivery_data.csv", "delivery.csv"],
+    "inventory": ["JD_inventory_data.csv", "inventory.csv"],
+    "network": ["JD_network_data.csv", "network.csv"],
+    "users": ["JD_user_data.csv", "users.csv", "user.csv"],
+    "skus": ["JD_sku_data.csv", "skus.csv", "sku.csv"],
 }
 
 
-def load_table(table_name: str, raw_dir: Path | str | None = None) -> pd.DataFrame:
-    if table_name not in JD_FILENAMES:
-        raise KeyError(f"Unknown table: {table_name}")
-
-    base_dir = Path(raw_dir) if raw_dir is not None else RAW_DATA_DIR
-    path = base_dir / JD_FILENAMES[table_name]
-    df = pd.read_csv(path)
-
-    for col in DATE_COLUMNS.get(table_name, []):
-        if col in df.columns:
-            df[col] = pd.to_datetime(df[col], errors="coerce")
-
-    if table_name == "orders":
-        if "promise" in df.columns:
-            df["promise_days"] = pd.to_numeric(df["promise"], errors="coerce")
-        discount_cols = [
-            "direct_discount_per_unit",
-            "quantity_discount_per_unit",
-            "bundle_discount_per_unit",
-            "coupon_discount_per_unit",
-        ]
-        for col in discount_cols:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
-
-    return df
+def standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy with lowercase, underscore-based column names."""
+    out = df.copy()
+    cleaned = []
+    for col in out.columns:
+        col_name = str(col).strip().lower()
+        col_name = re.sub(r"[^a-z0-9]+", "_", col_name)
+        col_name = re.sub(r"_+", "_", col_name).strip("_")
+        cleaned.append(col_name)
+    out.columns = cleaned
+    return out
 
 
-def load_core_tables(raw_dir: Path | str | None = None) -> dict[str, pd.DataFrame]:
-    table_names = ["orders", "delivery", "inventory", "network", "users", "skus"]
-    return {name: load_table(name, raw_dir=raw_dir) for name in table_names}
+def strip_string_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Trim whitespace from string-like columns and normalize blanks to NA."""
+    out = df.copy()
+    for col in out.columns:
+        if pd.api.types.is_object_dtype(out[col]) or pd.api.types.is_string_dtype(out[col]):
+            out[col] = out[col].astype("string").str.strip()
+            out[col] = out[col].replace({"": pd.NA, "nan": pd.NA, "None": pd.NA})
+    return out
 
 
-def missingness_report(df: pd.DataFrame) -> pd.DataFrame:
-    report = pd.DataFrame(
-        {
-            "missing_count": df.isna().sum(),
-            "missing_share": df.isna().mean(),
-            "dtype": df.dtypes.astype(str),
-        }
-    )
-    return report.sort_values(["missing_share", "missing_count"], ascending=False)
+def safe_to_datetime(series: pd.Series, format: str | None = None) -> pd.Series:
+    """Safely parse a pandas Series to datetime, coercing invalid values to NaT."""
+    if format is None:
+        return pd.to_datetime(series, errors="coerce")
+
+    parsed = pd.to_datetime(series, format=format, errors="coerce")
+    missing_mask = parsed.isna() & series.notna()
+    if missing_mask.any():
+        parsed.loc[missing_mask] = pd.to_datetime(series.loc[missing_mask], errors="coerce")
+    return parsed
 
 
-def duplicate_report(df: pd.DataFrame, key_cols: list[str]) -> dict[str, int]:
-    duplicated_rows = int(df.duplicated(subset=key_cols).sum())
-    unique_keys = int(df[key_cols].drop_duplicates().shape[0])
-    return {
-        "row_count": int(df.shape[0]),
-        "unique_key_count": unique_keys,
-        "duplicate_rows_on_key": duplicated_rows,
+def safe_to_numeric(series: pd.Series) -> pd.Series:
+    """Safely parse a pandas Series to numeric, coercing invalid values to NaN."""
+    return pd.to_numeric(series, errors="coerce")
+
+
+def find_required_columns(
+    df: pd.DataFrame,
+    required_columns: list[str],
+    table_name: str,
+) -> None:
+    """Raise a clear error if required columns are missing after normalization."""
+    missing = [col for col in required_columns if col not in df.columns]
+    if missing:
+        missing_text = ", ".join(missing)
+        raise ValueError(f"{table_name} is missing required columns: {missing_text}")
+
+
+def _coerce_string_id_columns(df: pd.DataFrame, extra_columns: list[str] | None = None) -> pd.DataFrame:
+    """Keep ID-like fields as clean strings."""
+    out = df.copy()
+    id_columns = [col for col in out.columns if col.endswith("_id")]
+    if extra_columns:
+        id_columns.extend(extra_columns)
+    for col in sorted(set(id_columns)):
+        if col in out.columns:
+            out[col] = out[col].astype("string").str.strip()
+            out[col] = out[col].replace({"": pd.NA, "nan": pd.NA, "None": pd.NA})
+    return out
+
+
+def _coerce_integer_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    """Safely coerce selected columns to pandas nullable integer dtype."""
+    out = df.copy()
+    for col in columns:
+        if col in out.columns:
+            out[col] = safe_to_numeric(out[col]).astype("Int64")
+    return out
+
+
+def _resolve_table_path(raw_dir: Path, table_name: str) -> Path:
+    """Find the CSV path for a logical table name inside the raw data folder."""
+    candidates = TABLE_FILE_CANDIDATES.get(table_name, [])
+    for filename in candidates:
+        path = raw_dir / filename
+        if path.exists():
+            return path
+    candidate_text = ", ".join(candidates)
+    raise ValueError(f"Could not find raw file for '{table_name}'. Expected one of: {candidate_text}")
+
+
+def load_raw_tables(raw_dir: str | Path) -> dict[str, pd.DataFrame]:
+    """Load and clean the six required JD raw tables from a directory.
+
+    Parameters
+    ----------
+    raw_dir:
+        Folder containing the raw CSV files.
+
+    Returns
+    -------
+    dict[str, pd.DataFrame]
+        Dictionary with cleaned tables keyed by:
+        `orders`, `delivery`, `inventory`, `network`, `users`, `skus`.
+    """
+    raw_path = Path(raw_dir)
+    if not raw_path.exists():
+        raise ValueError(f"Raw data directory does not exist: {raw_path}")
+    if not raw_path.is_dir():
+        raise ValueError(f"Raw data path is not a directory: {raw_path}")
+
+    clean_functions = {
+        "orders": clean_orders,
+        "delivery": clean_delivery,
+        "inventory": clean_inventory,
+        "network": clean_network,
+        "users": clean_users,
+        "skus": clean_skus,
     }
 
+    tables: dict[str, pd.DataFrame] = {}
+    for table_name, cleaner in clean_functions.items():
+        file_path = _resolve_table_path(raw_path, table_name)
+        raw_df = pd.read_csv(file_path, dtype="string")
+        tables[table_name] = cleaner(raw_df)
 
-def add_order_value_fields(orders: pd.DataFrame) -> pd.DataFrame:
-    df = orders.copy()
-    df["gross_merchandise_value"] = df["quantity"] * df["original_unit_price"]
-    df["net_merchandise_value"] = df["quantity"] * df["final_unit_price"]
-    df["discount_total"] = df["gross_merchandise_value"] - df["net_merchandise_value"]
-    df["discount_rate"] = df["discount_total"] / df["gross_merchandise_value"].replace(0, pd.NA)
-    df["remote_fulfillment_flag"] = (df["dc_ori"] != df["dc_des"]).astype(int)
-    df["gift_item_flag"] = df["gift_item"].fillna(0).astype(int)
-    return df
+    return tables
 
 
-def build_order_line_base(
-    orders: pd.DataFrame,
-    users: pd.DataFrame,
-    skus: pd.DataFrame,
-) -> pd.DataFrame:
-    df = add_order_value_fields(orders)
-    df = df.merge(users, how="left", on="user_ID", validate="m:1")
-    df = df.merge(skus, how="left", on="sku_ID", validate="m:1", suffixes=("", "_sku"))
-    df["order_line_id"] = df["order_ID"].astype(str) + "_" + df["sku_ID"].astype(str)
-    return df
+def clean_orders(df: pd.DataFrame) -> pd.DataFrame:
+    """Clean the orders table and create basic discount consistency fields."""
+    out = standardize_columns(df)
+    out = strip_string_columns(out)
+    out = _coerce_string_id_columns(out)
 
+    required = [
+        "order_id",
+        "user_id",
+        "sku_id",
+        "order_date",
+        "order_time",
+        "quantity",
+        "type",
+        "promise",
+        "original_unit_price",
+        "final_unit_price",
+        "direct_discount_per_unit",
+        "quantity_discount_per_unit",
+        "bundle_discount_per_unit",
+        "coupon_discount_per_unit",
+        "gift_item",
+        "dc_ori",
+        "dc_des",
+    ]
+    find_required_columns(out, required, "orders")
 
-def build_delivery_summary(delivery: pd.DataFrame) -> pd.DataFrame:
-    df = delivery.copy()
-    df["ship_to_arrival_hours"] = (
-        (df["arr_time"] - df["ship_out_time"]).dt.total_seconds() / 3600.0
-    )
-    df["station_to_arrival_hours"] = (
-        (df["arr_time"] - df["arr_station_time"]).dt.total_seconds() / 3600.0
-    )
-    summary = (
-        df.groupby("order_ID", as_index=False)
-        .agg(
-            package_count=("package_ID", "nunique"),
-            first_ship_out_time=("ship_out_time", "min"),
-            final_arrival_time=("arr_time", "max"),
-            mean_ship_to_arrival_hours=("ship_to_arrival_hours", "mean"),
-        )
-    )
-    return summary
+    out["order_date"] = safe_to_datetime(out["order_date"]).dt.normalize()
+    out["order_time"] = safe_to_datetime(out["order_time"])
 
+    float_columns = [
+        "original_unit_price",
+        "final_unit_price",
+        "direct_discount_per_unit",
+        "quantity_discount_per_unit",
+        "bundle_discount_per_unit",
+        "coupon_discount_per_unit",
+    ]
+    for col in float_columns:
+        out[col] = safe_to_numeric(out[col])
 
-def build_order_fulfillment_fact(
-    orders: pd.DataFrame,
-    delivery: pd.DataFrame,
-    users: pd.DataFrame,
-    skus: pd.DataFrame,
-) -> pd.DataFrame:
-    order_lines = build_order_line_base(orders, users, skus)
-    delivery_summary = build_delivery_summary(delivery)
-    df = order_lines.merge(delivery_summary, how="left", on="order_ID", validate="m:1")
-    df["hours_to_ship"] = (
-        (df["first_ship_out_time"] - df["order_time"]).dt.total_seconds() / 3600.0
-    )
-    df["hours_to_delivery"] = (
-        (df["final_arrival_time"] - df["order_time"]).dt.total_seconds() / 3600.0
-    )
-    return df
-
-
-def build_assignment_candidates(
-    orders: pd.DataFrame,
-    inventory: pd.DataFrame,
-    network: pd.DataFrame,
-) -> pd.DataFrame:
-    order_lines = add_order_value_fields(orders).copy()
-    order_lines["order_line_id"] = (
-        order_lines["order_ID"].astype(str) + "_" + order_lines["sku_ID"].astype(str)
+    out = _coerce_integer_columns(
+        out,
+        ["quantity", "type", "promise", "gift_item", "dc_ori", "dc_des"],
     )
 
-    destination_region = network.rename(columns={"dc_ID": "dc_des"})
-    candidate_lookup = network.rename(columns={"dc_ID": "candidate_dc"})
-
-    candidates = order_lines.merge(
-        destination_region,
-        how="left",
-        on="dc_des",
-        validate="m:1",
-    ).merge(
-        candidate_lookup,
-        how="left",
-        on="region_ID",
-        validate="m:m",
+    out["discount_total_per_unit"] = (
+        out["direct_discount_per_unit"].fillna(0)
+        + out["quantity_discount_per_unit"].fillna(0)
+        + out["bundle_discount_per_unit"].fillna(0)
+        + out["coupon_discount_per_unit"].fillna(0)
+    )
+    out["discount_gap"] = (
+        out["original_unit_price"] - out["final_unit_price"] - out["discount_total_per_unit"]
     )
 
-    inventory_view = inventory.rename(columns={"dc_ID": "candidate_dc", "date": "order_date"})
-    candidates = candidates.merge(
-        inventory_view.assign(inventory_available=1),
-        how="left",
-        on=["candidate_dc", "sku_ID", "order_date"],
-        validate="m:m",
+    consistent_mask = (
+        out["original_unit_price"].notna()
+        & out["final_unit_price"].notna()
+        & out["discount_total_per_unit"].notna()
     )
+    out["discount_consistency_flag"] = pd.Series(pd.NA, index=out.index, dtype="Int64")
+    out.loc[consistent_mask, "discount_consistency_flag"] = (
+        out.loc[consistent_mask, "discount_gap"].abs() <= 1e-6
+    ).astype("Int64")
 
-    candidates["inventory_available"] = candidates["inventory_available"].fillna(0).astype(int)
-    candidates["candidate_is_current_origin"] = (
-        candidates["candidate_dc"] == candidates["dc_ori"]
-    ).astype(int)
-    candidates["candidate_is_destination_dc"] = (
-        candidates["candidate_dc"] == candidates["dc_des"]
-    ).astype(int)
-    candidates["candidate_remote_flag"] = (
-        candidates["candidate_dc"] != candidates["dc_des"]
-    ).astype(int)
-    return candidates
+    return out
+
+
+def clean_delivery(df: pd.DataFrame) -> pd.DataFrame:
+    """Clean the delivery table and safely parse shipment timestamps."""
+    out = standardize_columns(df)
+    out = strip_string_columns(out)
+    out = _coerce_string_id_columns(out)
+
+    required = [
+        "package_id",
+        "order_id",
+        "type",
+        "ship_out_time",
+        "arr_station_time",
+        "arr_time",
+    ]
+    find_required_columns(out, required, "delivery")
+
+    out = _coerce_integer_columns(out, ["type"])
+    out["ship_out_time"] = safe_to_datetime(out["ship_out_time"])
+    out["arr_station_time"] = safe_to_datetime(out["arr_station_time"])
+    out["arr_time"] = safe_to_datetime(out["arr_time"])
+
+    return out
+
+
+def clean_inventory(df: pd.DataFrame) -> pd.DataFrame:
+    """Clean the inventory table, deduplicate, and add binary availability."""
+    out = standardize_columns(df)
+    out = strip_string_columns(out)
+    out = _coerce_string_id_columns(out)
+
+    required = ["dc_id", "sku_id", "date"]
+    find_required_columns(out, required, "inventory")
+
+    out["date"] = safe_to_datetime(out["date"]).dt.normalize()
+    out = _coerce_integer_columns(out, ["dc_id"])
+    out = out.drop_duplicates(subset=["date", "dc_id", "sku_id"]).reset_index(drop=True)
+    out["inventory_available"] = 1
+
+    return out
+
+
+def clean_network(df: pd.DataFrame) -> pd.DataFrame:
+    """Clean and deduplicate the network table."""
+    out = standardize_columns(df)
+    out = strip_string_columns(out)
+
+    required = ["region_id", "dc_id"]
+    find_required_columns(out, required, "network")
+
+    out = _coerce_integer_columns(out, ["region_id", "dc_id"])
+    out = out.drop_duplicates(subset=["region_id", "dc_id"]).reset_index(drop=True)
+
+    return out
+
+
+def clean_users(df: pd.DataFrame) -> pd.DataFrame:
+    """Clean the users table and parse first order month when possible."""
+    out = standardize_columns(df)
+    out = strip_string_columns(out)
+    out = _coerce_string_id_columns(out)
+
+    required = ["user_id"]
+    find_required_columns(out, required, "users")
+
+    if "first_order_month" in out.columns:
+        out["first_order_month"] = safe_to_datetime(out["first_order_month"], format="%Y-%m")
+
+    return out
+
+
+def clean_skus(df: pd.DataFrame) -> pd.DataFrame:
+    """Clean the SKU table and parse activation windows when available."""
+    out = standardize_columns(df)
+    out = strip_string_columns(out)
+    out = _coerce_string_id_columns(out)
+
+    required = ["sku_id"]
+    find_required_columns(out, required, "skus")
+
+    # Raw JD SKU extract can list the same sku_id more than once; merges expect m:1.
+    out = out.drop_duplicates(subset=["sku_id"], keep="first").reset_index(drop=True)
+
+    if "activate_date" in out.columns:
+        out["activate_date"] = safe_to_datetime(out["activate_date"]).dt.normalize()
+    if "deactivate_date" in out.columns:
+        out["deactivate_date"] = safe_to_datetime(out["deactivate_date"]).dt.normalize()
+
+    return out
 

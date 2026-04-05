@@ -13,6 +13,8 @@ data/interim/*
 !data/interim/.gitkeep
 data/processed/*
 !data/processed/.gitkeep
+!data/processed/README.md
+!data/processed/README_cn.md
 
 reports/figures/*
 !reports/figures/.gitkeep
