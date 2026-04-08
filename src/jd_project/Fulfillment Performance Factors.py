@@ -113,3 +113,109 @@ df = df.merge(network.rename(columns={"dc_ID":"dc_des_int"}),
 
 print(f"\nMaster dataframe shape: {df.shape}")
 print(f"Missing actual_delivery_hours: {df['actual_delivery_hours'].isna().sum()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ANALYSIS 2 — FULFILLMENT PERFORMANCE FACTORS
+# ══════════════════════════════════════════════════════════════════════════════
+print("\n" + "=" * 60)
+print("ANALYSIS 2: FULFILLMENT PERFORMANCE FACTORS")
+print("=" * 60)
+ 
+df_del = df.dropna(subset=["actual_delivery_hours"]).copy()
+df_del = df_del[df_del["actual_delivery_hours"].between(0, 200)]  # sanity filter
+ 
+fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+fig.suptitle("Analysis 2 — Fulfillment Performance Factors", fontsize=15, fontweight="bold")
+ 
+# ── 2a. Cross-DC vs Same-DC delivery hours ─────────────────────────────────────
+ax = axes[0, 0]
+cross   = df_del[df_del["is_cross_dc"] == 1]["actual_delivery_hours"]
+same_dc = df_del[df_del["is_cross_dc"] == 0]["actual_delivery_hours"]
+ 
+ax.hist(same_dc, bins=50, alpha=0.6, color="#4C72B0", label=f"Same DC (n={len(same_dc):,})",
+        density=True)
+ax.hist(cross,   bins=50, alpha=0.6, color="#DD8452", label=f"Cross DC (n={len(cross):,})",
+        density=True)
+ax.axvline(same_dc.median(), color="#4C72B0", linestyle="--", linewidth=1.5)
+ax.axvline(cross.median(),   color="#DD8452", linestyle="--", linewidth=1.5)
+ax.set_xlabel("Delivery Hours")
+ax.set_ylabel("Density")
+ax.set_title("(2a) Same-DC vs Cross-DC Delivery Time")
+ax.legend()
+
+plt.show()
+ 
+u_stat, u_p = stats.mannwhitneyu(same_dc, cross, alternative="less")
+print(f"\n[2a] Cross-DC delays delivery?")
+print(f"  Same DC median = {same_dc.median():.1f}h,  Cross DC median = {cross.median():.1f}h")
+print(f"  MWU test (same < cross): p = {u_p:.4e}  → {'Yes, significant' if u_p < 0.05 else 'Not significant'}")
+ 
+# ── 2b. 1P vs 3P fulfillment hours ────────────────────────────────────────────
+ax = axes[0, 1]
+df_del_typed = df_del[df_del["product_type"].isin([1, 2])].copy()
+df_del_typed["product_label"] = df_del_typed["product_type"].map({1:"1P","2":"3P"})
+df_del_typed["product_label"] = df_del_typed["product_type"].map({1:"1P (JD Own)",2:"3P (Third-Party)"})
+ 
+sns.violinplot(data=df_del_typed, x="product_label", y="actual_delivery_hours",
+               palette={"1P (JD Own)":"#4C72B0","3P (Third-Party)":"#DD8452"},
+               inner="quartile", ax=ax)
+ax.set_xlabel("")
+ax.set_ylabel("Delivery Hours")
+ax.set_title("(2b) Delivery Time: 1P vs 3P")
+
+plt.show()
+ 
+p1d = df_del_typed[df_del_typed["product_type"]==1]["actual_delivery_hours"]
+p3d = df_del_typed[df_del_typed["product_type"]==2]["actual_delivery_hours"]
+_, p_type = stats.mannwhitneyu(p1d, p3d, alternative="two-sided")
+print(f"\n[2b] 1P vs 3P delivery hours")
+print(f"  1P median = {p1d.median():.1f}h,  3P median = {p3d.median():.1f}h")
+print(f"  MWU p = {p_type:.4e}")
+ 
+# ── 2c. Promised vs Actual delivery hours ─────────────────────────────────────
+ax = axes[1, 0]
+df_gap = df_del.dropna(subset=["promise", "delivery_gap"])
+gap_counts = df_gap["late_delivery"].value_counts().rename({0:"On Time",1:"Late"})
+ 
+ax.bar(gap_counts.index, gap_counts.values,
+       color=["#4C72B0","#DD8452"], edgecolor="white", width=0.4)
+for i, v in enumerate(gap_counts.values):
+    ax.text(i, v + 500, f"{v:,}\n({v/gap_counts.sum()*100:.1f}%)", ha="center", fontsize=10)
+ax.set_xticks(range(len(gap_counts)))
+ax.set_xticklabels(gap_counts.index)
+ax.set_ylabel("Number of Orders")
+ax.set_title("(2c) On-Time vs Late Delivery")
+
+plt.show()
+ 
+print(f"\n[2c] Promised vs actual delivery")
+print(f"  Late delivery rate = {df_gap['late_delivery'].mean()*100:.1f}%")
+print(f"  Mean delivery gap  = {df_gap['delivery_gap'].mean():.1f}h")
+ 
+# ── 2d. Inventory availability at destination DC ───────────────────────────────
+ax = axes[1, 1]
+inv_perf = (df_del.groupby("inv_available")["actual_delivery_hours"]
+            .agg(["median","mean","count"]).reset_index())
+inv_perf["label"] = inv_perf["inv_available"].map({0:"No Inv at Des DC",1:"Inv Available"})
+ 
+ax.bar(inv_perf["label"], inv_perf["median"],
+       color=["#DD8452","#4C72B0"], edgecolor="white", width=0.4)
+for _, row in inv_perf.iterrows():
+    ax.text(row["label"], row["median"] + 0.3,
+            f'Median: {row["median"]:.1f}h\n(n={int(row["count"]):,})',
+            ha="center", fontsize=9)
+ax.set_ylabel("Median Delivery Hours")
+ax.set_title("(2d) Delivery Time by Inventory Availability at Dest. DC")
+ 
+plt.show()
+ 
+inv0 = df_del[df_del["inv_available"]==0]["actual_delivery_hours"]
+inv1 = df_del[df_del["inv_available"]==1]["actual_delivery_hours"]
+if len(inv0) > 0 and len(inv1) > 0:
+    _, p_inv = stats.mannwhitneyu(inv0, inv1, alternative="greater")
+    print(f"\n[2d] Inventory availability")
+    print(f"  No inv median  = {inv0.median():.1f}h,  Inv available median = {inv1.median():.1f}h")
+    print(f"  MWU p (no_inv > inv) = {p_inv:.4e}")
+ 
+plt.tight_layout()
